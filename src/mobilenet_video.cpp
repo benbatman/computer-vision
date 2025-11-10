@@ -216,7 +216,7 @@ void save_and_show_image(const cv::Mat &img, const std::string &output_path = "o
 
 int main(int argc, char **argv)
 {
-    if (argc < 6)
+    if (argc < 7)
     {
         std::cerr << "usage: mobilenet_video <video> <model.pb> <model.pbtxt> <labels.pbtxt> <frame_interval> <output_video>\n";
         std::cerr << "  frame_interval: process every Nth frame (e.g., 5 = process every 5th frame)\n";
@@ -246,10 +246,19 @@ int main(int argc, char **argv)
     int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
 
     // Setup video writer
-    std::string outputVideoPath = argv[6]
+    std::string outputVideoPath = argv[6];
 
-                                  std::cout
-                                  << "Video Info:\n";
+    // MP4V codec
+    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+    cv::VideoWriter videoWriter(outputVideoPath, fourcc, fps, cv::Size(width, height));
+
+    if (!videoWriter.isOpened())
+    {
+        std::cerr << "Could not open the output video file: " << outputVideoPath << std::endl;
+        return 3;
+    }
+
+    std::cout << "Video Info:\n";
     std::cout << "  Resolution: " << width << "x" << height << "\n";
     std::cout << "  FPS: " << fps << "\n";
     std::cout << "  Total Frames: " << totalFrames << "\n";
@@ -267,26 +276,43 @@ int main(int argc, char **argv)
     int frameNumber = 0;
     int processedFrames = 0;
 
+    // Cache to store processed frames
+    std::unordered_map<int, cv::Mat> processedFrameCache;
+
     while (cap.read(frame))
     {
+        // frame gets reused in video capture loop, so clone it
+        cv::Mat outputFrame = frame.clone();
+
         // Process every Nth frame
         if (frameNumber % frameInterval == 0)
         {
-            auto [output_frame, valid_detections] = process_frame(frame, model, classes);
+            auto [processedFrame, validDetections] = process_frame(outputFrame, model, classes);
 
             // Output results
             double timestamp = frameNumber / fps;
             std::cout << "Frame " << frameNumber << " (t=" << std::fixed << std::setprecision(2)
-                      << timestamp << "s) - " << valid_detections.size() << " detections:\n";
+                      << timestamp << "s) - " << validDetections.size() << " detections:\n";
 
-            if (valid_detections.empty())
+            if (!validDetections.empty())
+            {
+                non_maximum_suppression(outputFrame, validDetections);
+            }
+
+            // Cache the processed frame
+            processedFrameCache[frameNumber] = outputFrame.clone();
+
+            std::cout << "Frame " << frameNumber << " (t=" << std::fixed << std::setprecision(2)
+                      << timestamp << "s) - " << validDetections.size() << " detections:\n";
+
+            // output for debugging purposes
+            if (validDetections.empty())
             {
                 std::cout << "  No objects detected\n";
             }
             else
             {
-                non_maximum_suppression(output_frame, valid_detections);
-                for (const auto &det : valid_detections)
+                for (const auto &det : validDetections)
                 {
                     std::cout << "  Class: " << det.class_name
                               << " | Score: " << std::round(det.score * 100) << "%"
@@ -298,6 +324,26 @@ int main(int argc, char **argv)
 
             processedFrames++;
         }
+        // For frames btn processed frames, use most recent processed frame detections
+        else
+        {
+            int lastProcessedFrame = (frameNumber / frameInterval) * frameInterval;
+            if (processedFrameCache.find(lastProcessedFrame) != processedFrameCache.end())
+            {
+                outputFrame = processedFrameCache[lastProcessedFrame].clone();
+            }
+        }
+
+        // Write the frame to output video
+        videoWriter.write(outputFrame);
+
+        // Progress
+        if (frameNumber % 100 == 0)
+        {
+            double progress = (double)frameNumber / totalFrames * 100.0;
+            std::cout << "Progress: " << std::fixed << std::setprecision(1) << progress << "% ("
+                      << frameNumber << "/" << totalFrames << " frames)\n";
+        }
 
         frameNumber++;
     }
@@ -308,5 +354,6 @@ int main(int argc, char **argv)
     std::cout << "  Processed frames: " << processedFrames << "\n";
 
     cap.release();
+    videoWriter.release();
     return 0;
 }
