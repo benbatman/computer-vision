@@ -8,6 +8,12 @@
 #include <regex>
 #include <unordered_map>
 #include <cmath>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
+#include <map>
 
 const float CONFIDENCE_THRESHOLD = 0.4f;
 const float LOW_CONFIDENCE_THRESHOLD = 0.2f;
@@ -19,6 +25,66 @@ const int LINE_WIDTH = 5;
 // colors
 cv::Scalar LOW_CONFIDENCE_COLOR = cv::Scalar(0, 0, 255); // Red
 cv::Scalar DEFAULT_COLOR = cv::Scalar(0, 255, 0);        // Green
+
+template <typename T>
+class BlockingQueue
+{
+public:
+    BlockingQueue(size_t capacity) : capacity_(capacity) {}
+    bool push(T &&item)
+    {
+        std::unique_lock<std::mutex> lock(m_);
+        cv_.wait(lock, [&]
+                 { return stop_ || q_.size() < capacity_; });
+        if (stop_)
+            return false;
+        q_.push(std::move(item));
+        cv_.notify_all();
+        return true;
+    }
+
+    bool pop(T &out)
+    {
+        std::unique_lock<std::mutex> lock(m_);
+        cv_.wait(lock, [&]
+                 { return stop_ || !q_.empty(); });
+        if (stop_ && q_.empty())
+            return false;
+        out = std::move(q_.front());
+        q_.pop();
+        cv_.notify_all();
+        return true;
+    }
+
+    void stop()
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        stop_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::queue<T> q_;
+    size_t capacity_;
+    bool stop_ = false;
+};
+
+// Task and result structs
+struct FrameTask
+{
+    int index;
+    double timestamp;
+    cv::Mat frame;
+};
+
+struct FrameResult
+{
+    int index;
+    cv::Mat processed;
+    int numDetections;
+};
 
 // Struct for detection info
 struct Detection
@@ -93,9 +159,6 @@ std::pair<cv::Mat, std::vector<Detection>> process_frame(
 
     cv::Mat blob = cv::dnn::blobFromImage(
         frame, 1.0 / 127.5, cv::Size(320, 320), cv::Scalar(127.5, 127.5, 127.5), true, false);
-
-    std::cout << "Original Image Size: " << cols << "x" << rows << "\n";
-    std::cout << "Blob Size: " << blob.size[3] << "x" << blob.size[2] << "\n";
 
     cvNet.setInput(blob);
     cv::Mat detectionMat = cvNet.forward();
@@ -218,7 +281,7 @@ int main(int argc, char **argv)
 {
     if (argc < 7)
     {
-        std::cerr << "usage: mobilenet_video <video> <model.pb> <model.pbtxt> <labels.pbtxt> <frame_interval> <output_video>\n";
+        std::cerr << "usage: mobilenet_video <video> <model.pb> <model.pbtxt> <labels.pbtxt> <frame_interval> <output_video> [num_threads]\n";
         std::cerr << "  frame_interval: process every Nth frame (e.g., 5 = process every 5th frame)\n";
         return 1;
     }
@@ -230,6 +293,14 @@ int main(int argc, char **argv)
         std::cerr << "Error: frame_interval must be >= 1\n";
         return 1;
     }
+
+    unsigned hc = std::thread::hardware_concurrency();
+    if (hc == 0)
+        hc = 1;
+    int numThreads = (argc >= 8) ? std::stoi(argv[7]) : static_cast<int>(hc);
+    if (numThreads < 1)
+        numThreads = 1;
+    std::cout << "Using " << numThreads << " threads for processing.\n";
 
     // Open video file
     cv::VideoCapture cap(argv[1]);
@@ -249,6 +320,7 @@ int main(int argc, char **argv)
     std::string outputVideoPath = argv[6];
 
     // MP4V codec
+    std::cout << "Initializing video writer with MP4V codec...\n";
     int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
     cv::VideoWriter videoWriter(outputVideoPath, fourcc, fps, cv::Size(width, height));
 
@@ -267,91 +339,179 @@ int main(int argc, char **argv)
 
     // Load class names
     auto classes = load_tf_label_map(argv[4]);
-
-    // Load TensorFlow model
-    std::cout << "Loading model..." << "\n";
-    cv::dnn::Net model = load_tf_model(argv[2], argv[3]);
-
-    cv::Mat frame;
-    int frameNumber = 0;
-    int processedFrames = 0;
-
-    // Cache to store processed frames
-    std::unordered_map<int, cv::Mat> processedFrameCache;
-
-    while (cap.read(frame))
+    if (classes.empty())
     {
-        // frame gets reused in video capture loop, so clone it
-        cv::Mat outputFrame = frame.clone();
+        std::cerr << "No class labels loaded. Exiting.\n";
+        return 4;
+    }
 
-        // Process every Nth frame
-        if (frameNumber % frameInterval == 0)
+    std::cout << "Loading base model...\n";
+    cv::dnn::Net baseNet = load_tf_model(argv[2], argv[3]);
+    if (baseNet.empty())
+    {
+        std::cerr << "Model load failed. Check paths.\n";
+        return 4;
+    }
+    baseNet.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+    baseNet.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+
+    std::cout << "Spawning " << numThreads << " worker threads\n";
+
+    BlockingQueue<FrameTask> taskQueue(64);
+    std::mutex resultMutex;
+    std::map<int, FrameResult> pendingResults;
+    std::atomic<int> processedFrames{0};
+    std::atomic<bool> fatalModelError{false};
+
+    std::vector<cv::dnn::Net> nets;
+    nets.reserve(numThreads);
+    // Load separate model instance for each thread
+    for (int i = 0; i < numThreads; ++i)
+    {
+        nets.emplace_back(load_tf_model(argv[2], argv[3]));
+    }
+
+    // Worker
+    auto worker = [&](int tid)
+    {
+        cv::dnn::Net &localModel = nets[tid];
+        FrameTask task;
+        while (taskQueue.pop(task))
         {
-            auto [processedFrame, validDetections] = process_frame(outputFrame, model, classes);
-
-            // Output results
-            double timestamp = frameNumber / fps;
-            std::cout << "Frame " << frameNumber << " (t=" << std::fixed << std::setprecision(2)
-                      << timestamp << "s) - " << validDetections.size() << " detections:\n";
-
-            if (!validDetections.empty())
+            if (fatalModelError.load(std::memory_order_relaxed))
             {
-                non_maximum_suppression(outputFrame, validDetections);
+                break;
             }
-
-            // Cache the processed frame
-            processedFrameCache[frameNumber] = outputFrame.clone();
-
-            std::cout << "Frame " << frameNumber << " (t=" << std::fixed << std::setprecision(2)
-                      << timestamp << "s) - " << validDetections.size() << " detections:\n";
-
-            // output for debugging purposes
-            if (validDetections.empty())
+            cv::Mat frameCopy = task.frame.clone();
+            std::vector<Detection> detections;
+            // Only run detection on interval frames, others will reuse last detections
+            if (task.index % frameInterval == 0)
             {
-                std::cout << "  No objects detected\n";
+                try
+                {
+                    auto processedFrame = process_frame(frameCopy, localModel, classes);
+                    frameCopy = processedFrame.first;
+                    detections = std::move(processedFrame.second);
+                    if (!detections.empty())
+                    {
+                        non_maximum_suppression(frameCopy, detections);
+                    }
+                }
+                catch (const cv::Exception &e)
+                {
+                    std::cerr << "OpenCV exception in worker " << tid << " on frame " << task.index << ": " << e.what() << std::endl;
+                    fatalModelError.store(true, std::memory_order_relaxed);
+                    taskQueue.stop();
+                    break;
+                }
             }
             else
             {
-                for (const auto &det : validDetections)
+                // No processing, just pass through
+            }
+            {
+                std::lock_guard<std::mutex> lock(resultMutex);
+                pendingResults.emplace(task.index, FrameResult{task.index, frameCopy, static_cast<int>(detections.size())});
+            }
+            processedFrames.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    // Launch workers
+    std::vector<std::thread> threads;
+    for (int i = -0; i < numThreads; ++i)
+    {
+        threads.emplace_back(worker, i);
+    }
+
+    int nextWriteIndex = 0;
+    cv::Mat lastProcessedFrame; // cache last interval processed frame
+
+    // Produceer and writer loop
+    int frameNumber = 0;
+
+    while (true)
+    {
+        cv::Mat frame;
+        if (!cap.read(frame))
+        {
+            break; // End of video
+        }
+        double timestamp = frameNumber / fps;
+
+        // Enqueue task
+        taskQueue.push(FrameTask{frameNumber, timestamp, frame});
+
+        // Drain available in-order results
+        bool advanced = true;
+        while (advanced)
+        {
+            advanced = false;
+            {
+                std::lock_guard<std::mutex> lock(resultMutex);
+                auto it = pendingResults.find(nextWriteIndex);
+                if (it != pendingResults.end())
                 {
-                    std::cout << "  Class: " << det.class_name
-                              << " | Score: " << std::round(det.score * 100) << "%"
-                              << " | Box: [" << det.box.x << ", " << det.box.y
-                              << ", " << det.box.width << ", " << det.box.height << "]\n";
+                    cv::Mat outputFrame = it->second.processed;
+
+                    // If this frame not processed, substitute last processed annotated frame
+                    if (nextWriteIndex % frameInterval != 0 && !lastProcessedFrame.empty())
+                    {
+                        outputFrame = lastProcessedFrame.clone();
+                    }
+                    else if (nextWriteIndex % frameInterval == 0)
+                    {
+                        lastProcessedFrame = outputFrame.clone();
+                    }
+
+                    videoWriter.write(outputFrame);
+                    pendingResults.erase(it);
+                    nextWriteIndex++;
+                    advanced = true;
+
+                    if (nextWriteIndex % 100 == 0)
+                    {
+                        double progress = (double)nextWriteIndex / totalFrames * 100.0;
+                        std::cout << "Progress: " << std::fixed << std::setprecision(1)
+                                  << progress << "% (" << nextWriteIndex << "/" << totalFrames << ")\n";
+                    }
                 }
             }
-            std::cout << "\n";
-
-            processedFrames++;
         }
-        // For frames btn processed frames, use most recent processed frame detections
-        else
-        {
-            int lastProcessedFrame = (frameNumber / frameInterval) * frameInterval;
-            if (processedFrameCache.find(lastProcessedFrame) != processedFrameCache.end())
-            {
-                outputFrame = processedFrameCache[lastProcessedFrame].clone();
-            }
-        }
-
-        // Write the frame to output video
-        videoWriter.write(outputFrame);
-
-        // Progress
-        if (frameNumber % 100 == 0)
-        {
-            double progress = (double)frameNumber / totalFrames * 100.0;
-            std::cout << "Progress: " << std::fixed << std::setprecision(1) << progress << "% ("
-                      << frameNumber << "/" << totalFrames << " frames)\n";
-        }
-
         frameNumber++;
     }
 
-    std::cout << std::string(60, '=') << "\n";
-    std::cout << "Processing complete!\n";
-    std::cout << "  Total frames: " << frameNumber << "\n";
-    std::cout << "  Processed frames: " << processedFrames << "\n";
+    // Signal workers to stop
+    taskQueue.stop();
+    for (auto &t : threads)
+        t.join();
+
+    // Flush reamaining results in order
+    while (nextWriteIndex < frameNumber)
+    {
+        std::lock_guard<std::mutex> lock(resultMutex);
+        auto it = pendingResults.find(nextWriteIndex);
+        if (it != pendingResults.end())
+        {
+            cv::Mat outputFrame = it->second.processed;
+            if (nextWriteIndex % frameInterval != 0 && !lastProcessedFrame.empty())
+            {
+                outputFrame = lastProcessedFrame.clone();
+            }
+            else if (nextWriteIndex % frameInterval == 0)
+            {
+                lastProcessedFrame = outputFrame.clone();
+            }
+            videoWriter.write(outputFrame);
+            pendingResults.erase(it);
+            ++nextWriteIndex;
+        }
+    }
+
+    std::cout << "============================================\n";
+    std::cout << "Parallel processing complete\n";
+    std::cout << "Total frames: " << frameNumber << "\n";
+    std::cout << "Processed tasks: " << processedFrames.load() << "\n";
 
     cap.release();
     videoWriter.release();
